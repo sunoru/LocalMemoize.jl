@@ -100,7 +100,6 @@ macro memoize(args...)
             haskey($func_cachename, $(memoargs...)) ? $func2_name($(argname_list...)) : $func1_name($(argname_list...))
         end
     end
-    println(result)
     esc(result)
 end
 
