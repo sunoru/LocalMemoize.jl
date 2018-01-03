@@ -1,20 +1,20 @@
 module LocalMemoize
 
-export @memo, @memoize
+export @memo, @memoize, get_memos, clear_memos
+
+get_memos(::Type) = error("No memoized cache found")
+get_memos(func) = get_memos(typeof(func))
+clear_memos(functype) = error("No memoized cache found")
 
 macro memo(expr)
     esc(expr)
 end
 
-macro memoize(args...)
-    length(args) > 2 && error("@memoize supports at most 2 arguments.")
-    if length(args) == 1
-        expr = args[1]
-        dict = :(ObjectIdDict)
-    else
-        expr = args[2]
-        dict = args[1]
-    end
+macro memo(args...)
+    nothing
+end
+
+macro memoize(expr)
     if typeof(expr) != Expr || !(expr.head == :function || expr.head == :(=) && expr.args[1].head == :call)
         error("@memoize must be used on a function declaration.")
     end
@@ -22,82 +22,138 @@ macro memoize(args...)
     funcname = funcdecl.args[1]
     funcargs = funcdecl.args[2:end]
     funcbody = expr.args[2].args
-    memoargs = Symbol[]
+    memo_argnames = Symbol[]
+    memo_argtypes = Symbol[]
     argdef_list = []
-    argname_list = []
+    argname_list = Symbol[]
+    argtype_list = Symbol[]
     check_memocall = arg -> typeof(arg) == Expr && arg.head == :macrocall &&
-        arg.args[1] == Symbol("@memo") && length(arg.args) == 2
+        arg.args[1] == Symbol("@memo") && length(arg.args) > 1
     for arg in funcargs
         if check_memocall(arg)
+            length(arg.args) != 2 && error("@memo in argument list only must have one and only one argument.")
             argdef = arg.args[2]
         else
             argdef = arg
         end
         if typeof(argdef) == Symbol
             argname = argdef
-        elseif typeof(argdef) == Expr && arg.args[2].head == :(::)
-            argname = arg.args[2].args[1]
+            argtype = :Any
+        elseif typeof(argdef) == Expr && argdef.head == :(::)
+            argname = argdef.args[1]
+            argtype = argdef.args[2]
+        else
+            error("Invalid argument list")
         end
         if check_memocall(arg)
-            push!(memoargs, argname)
+            push!(memo_argnames, argname)
+            push!(memo_argtypes, argtype)
         end
         push!(argdef_list, argdef)
         push!(argname_list, argname)
+        push!(argtype_list, argtype)
     end
-    func_cachename = Symbol(string(gensym(), "_", funcname, "_memocache"))
-    cachename = Symbol(string(gensym(), "_", funcname, "_cache"))
-    func1_name = Symbol(string(gensym(), "_", funcname, "_1"))
-    func2_name = Symbol(string(gensym(), "_", funcname, "_2"))
 
-    func1 = :(
-        function $func1_name($(argdef_list...))
-            $cachename = $func_cachename[$(memoargs...)] = Dict{Symbol, Any}()
-        end
-    ) # for first time run
-    func2 = :(
-        function $func2_name($(argdef_list...))
-            $cachename = $func_cachename[$(memoargs...)]
-        end
-    ) # for memoized runs
-    func1_body = func1.args[end].args
-    func2_body = func2.args[end].args
     lines = 0
+    check_memolist = args -> all(arg -> typeof(arg) == Symbol, args)
     check_assignment = arg -> typeof(arg) == Expr && arg.head == :(=) &&
         typeof(arg.args[1]) == Symbol
+    memolist = Symbol[]
     for (i, expression) in enumerate(funcbody)
         if check_memocall(expression)
-            assignment = expression.args[2]
-            check_assignment(expression.args[2]) || error("@memo in body must be used on an assignment")
+            if check_memolist(expression.args[2:end])
+                append!(memolist, expression.args[2:end])
+            elseif check_assignment(expression.args[2])
+                push!(memolist, expression.args[2].args[1])
+            else
+                error("@memo in body must be used on an assignment or a list of variables to be memoized.")
+            end
             lines = i
         end
     end
     lines == 0 && error("No @memo found in function body.")
-    for (i, expression) in enumerate(funcbody)
-        if i > lines
-            push!(func1_body, expression)
-            push!(func2_body, expression)
-            continue
+
+    getsymbol = name -> Symbol(string(gensym(), "_", funcname, "_", name))
+
+    func_cachename = getsymbol("memocache")
+    cachename = getsymbol("cache")
+    gettype_func_name = getsymbol("gettype")
+    func1_name = getsymbol("1")
+    func2_name = getsymbol("2")
+    cache_struct = getsymbol("cache_t")
+    dict = :(Dict{Tuple{$(memo_argtypes...)}, $cache_struct})
+
+
+    gettype_func = :(
+        function $gettype_func_name($(argdef_list...))
         end
+    )
+    func1 = :(
+        function $func1_name($func_cachename::$dict, $(argdef_list...))
+            # $cachename = $func_cachename[$(memo_argnames...)] = $cache_struct()
+            #TODO:
+        end
+    ) # for first time run
+    func2 = :(
+        function $func2_name($func_cachename::$dict, $(argdef_list...))
+            $cachename = $func_cachename[($(memo_argnames...),)]
+        end
+    ) # for memoized runs
+    gettype_func_body = gettype_func.args[end].args
+    func1_body = func1.args[end].args
+    func2_body = func2.args[end].args
+
+    for (i, expression) in enumerate(funcbody)
         if check_memocall(expression)
-            push!(func1_body, expression.args[2])
-            argname = expression.args[2].args[1]
-            push!(func1_body, :(
-                $cachename[$(QuoteNode(argname))] = $argname
-            ))
-            push!(func2_body, :(
-                $argname = $cachename[$(QuoteNode(argname))]
-            ))
+            if !check_memolist(expression.args[2:end])
+                push!(gettype_func_body, expression.args[2])
+                push!(func1_body, expression.args[2])
+            end
         else
+            push!(gettype_func_body, expression)
             push!(func1_body, expression)
+        end
+        if i == lines
+            push!(gettype_func_body, :(
+                return ($(memolist...),)
+            ))
+            push!(func1_body, :(
+                $func_cachename[($(memo_argnames...),)] = $cache_struct($(memolist...))
+            ))
+            for memovar in memolist
+                push!(func2_body, :(
+                    $memovar = getfield($cachename, $(QuoteNode(memovar)))
+                ))
+            end
+        elseif i > lines
+            push!(func2_body, expression)
         end
     end
 
     result = quote
+        let gettype_func = $gettype_func
+            code_info = code_typed(gettype_func, ($(argtype_list...),))
+            types = code_info[1].second
+            cache_struct = $(QuoteNode(cache_struct))
+            struct_code = :(struct $cache_struct end)
+            argnames = $memolist
+            for (argname, typ) in zip(argnames, types.types)
+                push!(struct_code.args[end].args, :($argname::$typ))
+            end
+            eval(struct_code)
+        end
         $func_cachename = $dict()
         $func1
         $func2
         function $funcname($(argdef_list...))
-            haskey($func_cachename, $(memoargs...)) ? $func2_name($(argname_list...)) : $func1_name($(argname_list...))
+            haskey($func_cachename, ($(memo_argnames...),)) ?
+                $func2_name($func_cachename, $(argname_list...)) :
+                $func1_name($func_cachename, $(argname_list...))
+        end
+        LocalMemoize.get_memos(::Type{typeof($funcname)}) = $func_cachename
+        LocalMemoize.clear_memos(::Type{typeof($funcname)}) = begin
+            global $func_cachename
+            $func_cachename = $dict()
         end
     end
     esc(result)
