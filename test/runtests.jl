@@ -53,4 +53,4 @@ end
     a * y
 end
 @test test_dispatch(1.0, 2.0) == test_dispatch(1.0, 2.0)
-@test test_dispatch(1, 2.0) == test_dispatch(1, 2.0)
+@test test_dispatch(Int64(1), 2.0) == test_dispatch(Int64(1), 2.0)
