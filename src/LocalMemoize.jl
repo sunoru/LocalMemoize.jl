@@ -2,9 +2,20 @@ module LocalMemoize
 
 export @memo, @memoize, get_memos, clear_memos
 
-get_memos(::Type) = error("No memoized cache found")
+const MemoizedFunctions = ObjectIdDict()
+
+get_memos(::Type{T}) where T = haskey(MemoizedFunctions, T) ?
+    MemoizedFunctions[T] :
+    error("No memoized cache found")
 get_memos(func) = get_memos(typeof(func))
-clear_memos(::Type) = error("No memoized cache found")
+clear_memos(::Type{T}) where T = haskey(MemoizedFunctions, T) ?
+    map(MemoizedFunctions[T]) do cache_table
+        for key in keys(cache_table)
+            delete!(cache_table, key)
+        end
+        cache_table
+    end :
+    error("No memoized cache found")
 clear_memos(func) = clear_memos(typeof(func))
 
 macro memo(expr)
@@ -155,11 +166,11 @@ macro memoize(expr)
                 $func2_name($func_cachename, $(argname_list...)) :
                 $func1_name($func_cachename, $(argname_list...))
         end
-        LocalMemoize.get_memos(::Type{typeof($funcname)}) = $func_cachename
-        LocalMemoize.clear_memos(::Type{typeof($funcname)}) = begin
-            global $func_cachename
-            $func_cachename = $dict()
+        if !haskey(LocalMemoize.MemoizedFunctions, typeof($funcname))
+            LocalMemoize.MemoizedFunctions[typeof($funcname)] = Any[]
         end
+        push!(LocalMemoize.MemoizedFunctions[typeof($funcname)], $func_cachename)
+        $funcname
     end
     esc(result)
 end
