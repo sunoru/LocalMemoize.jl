@@ -4,7 +4,8 @@ export @memo, @memoize, get_memos, clear_memos
 
 get_memos(::Type) = error("No memoized cache found")
 get_memos(func) = get_memos(typeof(func))
-clear_memos(functype) = error("No memoized cache found")
+clear_memos(::Type) = error("No memoized cache found")
+clear_memos(func) = clear_memos(typeof(func))
 
 macro memo(expr)
     esc(expr)
@@ -15,8 +16,8 @@ macro memo(args...)
 end
 
 macro memoize(expr)
-    if typeof(expr) != Expr || !(expr.head == :function || expr.head == :(=) && expr.args[1].head == :call)
-        error("@memoize must be used on a function declaration.")
+    if typeof(expr) != Expr || expr.head != :function
+        error("@memoize must be used on a function declaration in traditional syntax.")
     end
     funcdecl = expr.args[1]
     funcname = funcdecl.args[1]
@@ -39,6 +40,15 @@ macro memoize(expr)
         if typeof(argdef) == Symbol
             argname = argdef
             argtype = :Any
+        elseif typeof(argdef) == Expr && (argdef.head == :(=) || argdef.head == :kw)
+            argdef1 = argdef.args[1]
+            if typeof(argdef1) == Symbol
+                argname = argdef1
+                argtype = :Any
+            elseif typeof(argdef1) == Expr && argdef1.head == :(::)
+                argname = argdef1.args[1]
+                argtype = argdef2.args[2]
+            end
         elseif typeof(argdef) == Expr && argdef.head == :(::)
             argname = argdef.args[1]
             argtype = argdef.args[2]
@@ -53,6 +63,7 @@ macro memoize(expr)
         push!(argname_list, argname)
         push!(argtype_list, argtype)
     end
+    length(memo_argnames) == 0 && error("At least one argument should be tagged with @memo.")
 
     lines = 0
     check_memolist = args -> all(arg -> typeof(arg) == Symbol, args)
@@ -83,22 +94,16 @@ macro memoize(expr)
     cache_struct = getsymbol("cache_t")
     dict = :(Dict{Tuple{$(memo_argtypes...)}, $cache_struct})
 
-
-    gettype_func = :(
-        function $gettype_func_name($(argdef_list...))
-        end
-    )
-    func1 = :(
-        function $func1_name($func_cachename::$dict, $(argdef_list...))
-            # $cachename = $func_cachename[$(memo_argnames...)] = $cache_struct()
-            #TODO:
-        end
-    ) # for first time run
+    # For getting memoized type
+    gettype_func = :(function $gettype_func_name($(argdef_list...)) end)
+    # For first time run
+    func1 = :(function $func1_name($func_cachename::$dict, $(argdef_list...)) end)
+    # For memoized runs
     func2 = :(
         function $func2_name($func_cachename::$dict, $(argdef_list...))
             $cachename = $func_cachename[($(memo_argnames...),)]
         end
-    ) # for memoized runs
+    )
     gettype_func_body = gettype_func.args[end].args
     func1_body = func1.args[end].args
     func2_body = func2.args[end].args
