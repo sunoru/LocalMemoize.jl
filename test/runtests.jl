@@ -56,5 +56,5 @@ end
 @test test_dispatch(Int64(1), 2.0) == test_dispatch(Int64(1), 2.0)
 
 @memoize test_return(x::Int64) = x < 3 ? 1 : (test_return(x - 1) + test_return(x - 2))
-@test test_return(5) == 5
-@test test_return(100) == 3736710778780434371
+@test test_return(Int64(5)) == 5
+@test test_return(Int64(100)) == 3736710778780434371
