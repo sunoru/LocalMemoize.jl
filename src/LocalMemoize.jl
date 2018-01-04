@@ -27,13 +27,17 @@ macro memo(args...)
 end
 
 macro memoize(expr)
-    if typeof(expr) != Expr || expr.head != :function
-        error("@memoize must be used on a function declaration in traditional syntax.")
+    if typeof(expr) == Expr && expr.head == :function
+        assign_syntax = false
+    elseif typeof(expr) == Expr && expr.head == :(=) && expr.args[1].head == :call
+        assign_syntax = true
+    else
+        error("@memoize must be used on a function declaration.")
     end
     funcdecl = expr.args[1]
     funcname = funcdecl.args[1]
     funcargs = funcdecl.args[2:end]
-    funcbody = expr.args[2].args
+    funcbody = expr.args[2]
     memo_argnames = Symbol[]
     memo_argtypes = Symbol[]
     argdef_list = []
@@ -74,14 +78,13 @@ macro memoize(expr)
         push!(argname_list, argname)
         push!(argtype_list, argtype)
     end
-    length(memo_argnames) == 0 && error("At least one argument should be tagged with @memo.")
 
     lines = 0
     check_memolist = args -> all(arg -> typeof(arg) == Symbol, args)
     check_assignment = arg -> typeof(arg) == Expr && arg.head == :(=) &&
         typeof(arg.args[1]) == Symbol
     memolist = Symbol[]
-    for (i, expression) in enumerate(funcbody)
+    for (i, expression) in enumerate(funcbody.args)
         if check_memocall(expression)
             if check_memolist(expression.args[2:end])
                 append!(memolist, expression.args[2:end])
@@ -93,84 +96,116 @@ macro memoize(expr)
             lines = i
         end
     end
-    lines == 0 && error("No @memo found in function body.")
+    memoize_return = lines == 0
+    if memoize_return && length(memo_argnames) != 0
+        error("In function memoization @memo can not be used on arguments.")
+    end
+    if memoize_return
+        memo_argnames = argname_list
+        memo_argtypes = argtype_list
+    end
 
     getsymbol = name -> Symbol(string(gensym(), "_", funcname, "_", name))
 
     func_cachename = getsymbol("memocache")
     cachename = getsymbol("cache")
-    gettype_func_name = getsymbol("gettype")
-    func1_name = getsymbol("1")
-    func2_name = getsymbol("2")
+
     cache_struct = getsymbol("cache_t")
-    dict = :(Dict{Tuple{$(memo_argtypes...)}, $cache_struct})
+    dict_type = :(Dict{Tuple{$(memo_argtypes...)}, $(cache_struct)})
 
-    # For getting memoized type
-    gettype_func = :(function $gettype_func_name($(argdef_list...)) end)
-    # For first time run
-    func1 = :(function $func1_name($func_cachename::$dict, $(argdef_list...)) end)
-    # For memoized runs
-    func2 = :(
-        function $func2_name($func_cachename::$dict, $(argdef_list...))
-            $cachename = $func_cachename[($(memo_argnames...),)]
-        end
-    )
-    gettype_func_body = gettype_func.args[end].args
-    func1_body = func1.args[end].args
-    func2_body = func2.args[end].args
-
-    for (i, expression) in enumerate(funcbody)
-        if check_memocall(expression)
-            if !check_memolist(expression.args[2:end])
-                push!(gettype_func_body, expression.args[2])
-                push!(func1_body, expression.args[2])
+    if memoize_return
+        original_func_name = getsymbol("original")
+        original_func = :($original_func_name($(argdef_list...))=$funcbody)
+        result = quote
+            const $cache_struct = let gettype_func = $expr
+                code_info = code_typed(gettype_func, ($(argtype_list...),))
+                code_info[1].second
             end
-        else
-            push!(gettype_func_body, expression)
-            push!(func1_body, expression)
+            $func_cachename = $dict_type()
+            $original_func
+            function $funcname($(argdef_list...))
+                haskey($func_cachename, ($(memo_argnames...),)) ?
+                    $func_cachename[($(memo_argnames...),)]::$cache_struct :
+                    ($func_cachename[($(memo_argnames...),)] = $original_func_name($(argname_list...)))
+            end
+            if !haskey(LocalMemoize.MemoizedFunctions, typeof($funcname))
+                LocalMemoize.MemoizedFunctions[typeof($funcname)] = Any[]
+            end
+            push!(LocalMemoize.MemoizedFunctions[typeof($funcname)], $func_cachename)
+            $funcname
         end
-        if i == lines
-            push!(gettype_func_body, :(
-                return ($(memolist...),)
-            ))
-            push!(func1_body, :(
-                $func_cachename[($(memo_argnames...),)] = $cache_struct($(memolist...))
-            ))
-            for memovar in memolist
-                push!(func2_body, :(
-                    $memovar = getfield($cachename, $(QuoteNode(memovar)))
+     else
+        gettype_func_name = getsymbol("gettype")
+        func1_name = getsymbol("1")
+        func2_name = getsymbol("2")
+
+        # For getting memoized type
+        gettype_func = :(function $gettype_func_name($(argdef_list...)) end)
+        # For first time run
+        func1 = :(function $func1_name($func_cachename::$dict_type, $(argdef_list...)) end)
+        # For memoized runs
+        func2 = :(
+            function $func2_name($func_cachename::$dict_type, $(argdef_list...))
+                $cachename = $func_cachename[($(memo_argnames...),)]
+            end
+        )
+        gettype_func_body = gettype_func.args[end].args
+        func1_body = func1.args[end].args
+        func2_body = func2.args[end].args
+
+        for (i, expression) in enumerate(funcbody.args)
+            if check_memocall(expression)
+                if !check_memolist(expression.args[2:end])
+                    push!(gettype_func_body, expression.args[2])
+                    push!(func1_body, expression.args[2])
+                end
+            else
+                push!(gettype_func_body, expression)
+                push!(func1_body, expression)
+            end
+            if i == lines
+                push!(gettype_func_body, :(
+                    return ($(memolist...),)
                 ))
+                push!(func1_body, :(
+                    $func_cachename[($(memo_argnames...),)] = $cache_struct($(memolist...))
+                ))
+                for memovar in memolist
+                    push!(func2_body, :(
+                        $memovar = getfield($cachename, $(QuoteNode(memovar)))
+                    ))
+                end
+            elseif i > lines
+                push!(func2_body, expression)
             end
-        elseif i > lines
-            push!(func2_body, expression)
         end
-    end
 
-    result = quote
-        let gettype_func = $gettype_func
-            code_info = code_typed(gettype_func, ($(argtype_list...),))
-            types = code_info[1].second
-            cache_struct = $(QuoteNode(cache_struct))
-            struct_code = :(struct $cache_struct end)
-            argnames = $memolist
-            for (argname, typ) in zip(argnames, types.types)
-                push!(struct_code.args[end].args, :($argname::$typ))
+        result = quote
+            let gettype_func = $gettype_func
+                code_info = code_typed(gettype_func, ($(argtype_list...),))
+                types = code_info[1].second
+                cache_struct = $(QuoteNode(cache_struct))
+                struct_code = :(struct $cache_struct end)
+                argnames = $memolist
+                for (argname, typ) in zip(argnames, types.types)
+                    push!(struct_code.args[end].args, :($argname::$typ))
+                end
+                eval(struct_code)
             end
-            eval(struct_code)
+            $func_cachename = $dict_type()
+            $func1
+            $func2
+            function $funcname($(argdef_list...))
+                haskey($func_cachename, ($(memo_argnames...),)) ?
+                    $func2_name($func_cachename, $(argname_list...)) :
+                    $func1_name($func_cachename, $(argname_list...))
+            end
+            if !haskey(LocalMemoize.MemoizedFunctions, typeof($funcname))
+                LocalMemoize.MemoizedFunctions[typeof($funcname)] = Any[]
+            end
+            push!(LocalMemoize.MemoizedFunctions[typeof($funcname)], $func_cachename)
+            $funcname
         end
-        $func_cachename = $dict()
-        $func1
-        $func2
-        function $funcname($(argdef_list...))
-            haskey($func_cachename, ($(memo_argnames...),)) ?
-                $func2_name($func_cachename, $(argname_list...)) :
-                $func1_name($func_cachename, $(argname_list...))
-        end
-        if !haskey(LocalMemoize.MemoizedFunctions, typeof($funcname))
-            LocalMemoize.MemoizedFunctions[typeof($funcname)] = Any[]
-        end
-        push!(LocalMemoize.MemoizedFunctions[typeof($funcname)], $func_cachename)
-        $funcname
     end
     esc(result)
 end
