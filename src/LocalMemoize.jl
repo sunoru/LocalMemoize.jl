@@ -27,14 +27,20 @@ macro memo(args...)
 end
 
 macro memoize(expr)
-    if typeof(expr) == Expr && expr.head == :function
+    if expr isa Expr && expr.head == :function
         assign_syntax = false
-    elseif typeof(expr) == Expr && expr.head == :(=) && expr.args[1].head == :call
+    elseif expr isa Expr && expr.head == :(=) && (expr.args[1].head == :call ||
+        expr.args[1].head == :(::) && expr.args[1].args[1].head == :call)
         assign_syntax = true
     else
         error("@memoize must be used on a function declaration.")
     end
     funcdecl = expr.args[1]
+    funcrett = nothing
+    if funcdecl.head == :(::)
+        funcrett = funcdecl.args[2]
+        funcdecl = funcdecl.args[1]
+    end
     funcname = funcdecl.args[1]
     funcargs = funcdecl.args[2:end]
     funcbody = expr.args[2]
@@ -43,7 +49,7 @@ macro memoize(expr)
     argdef_list = []
     argname_list = Symbol[]
     argtype_list = Symbol[]
-    check_memocall = arg -> typeof(arg) == Expr && arg.head == :macrocall &&
+    check_memocall = arg -> arg isa Expr && arg.head == :macrocall &&
         arg.args[1] == Symbol("@memo") && length(arg.args) > 1
     for arg in funcargs
         if check_memocall(arg)
@@ -52,21 +58,22 @@ macro memoize(expr)
         else
             argdef = arg
         end
-        if typeof(argdef) == Symbol
+        if argdef isa Symbol
             argname = argdef
             argtype = :Any
-        elseif typeof(argdef) == Expr && (argdef.head == :(=) || argdef.head == :kw)
+        elseif argdef isa Expr && (argdef.head == :(=) || argdef.head == :kw)
             argdef1 = argdef.args[1]
-            if typeof(argdef1) == Symbol
+            if argdef1 isa Symbol
                 argname = argdef1
                 argtype = :Any
-            elseif typeof(argdef1) == Expr && argdef1.head == :(::)
+            elseif argdef1 isa Expr && argdef1.head == :(::)
                 argname = argdef1.args[1]
                 argtype = argdef2.args[2]
             end
-        elseif typeof(argdef) == Expr && argdef.head == :(::)
+        elseif argdef isa Expr && argdef.head == :(::)
             argname = argdef.args[1]
             argtype = argdef.args[2]
+        elseif argdef isa Expr && argdef.head == :parameters
         else
             error("Invalid argument list")
         end
@@ -80,9 +87,9 @@ macro memoize(expr)
     end
 
     lines = 0
-    check_memolist = args -> all(arg -> typeof(arg) == Symbol, args)
-    check_assignment = arg -> typeof(arg) == Expr && arg.head == :(=) &&
-        typeof(arg.args[1]) == Symbol
+    check_memolist = args -> all(arg -> arg isa Symbol, args)
+    check_assignment = arg -> arg isa Expr && arg.head == :(=) &&
+        arg.args[1] isa Symbol
     memolist = Symbol[]
     for (i, expression) in enumerate(funcbody.args)
         if check_memocall(expression)
@@ -109,6 +116,7 @@ macro memoize(expr)
 
     func_cachename = getsymbol("memocache")
     cachename = getsymbol("cache")
+    index_name = getsymbol("index")
 
     cache_struct = getsymbol("cache_t")
     dict_type = :(Dict{Tuple{$(memo_argtypes...)}, $(cache_struct)})
@@ -116,18 +124,24 @@ macro memoize(expr)
     if memoize_return
         original_func_name = getsymbol("original")
         original_func = :($original_func_name($(argdef_list...))=$funcbody)
-        result = quote
-            const $cache_struct = let gettype_func = $expr
-                code_info = code_typed(gettype_func, ($(argtype_list...),))
-                code_info[1].second
-            end
-            $func_cachename = $dict_type()
-            $original_func
+        func_main = :(
             function $funcname($(argdef_list...))
-                haskey($func_cachename, ($(memo_argnames...),)) ?
-                    $func_cachename[($(memo_argnames...),)]::$cache_struct :
-                    ($func_cachename[($(memo_argnames...),)] = $original_func_name($(argname_list...)))
+                $index_name = Base.ht_keyindex($func_cachename, ($(memo_argnames...),))
+                if $index_name >= 0
+                    @inbounds return $func_cachename.vals[$index_name]
+                else
+                    $func_cachename[($(memo_argnames...),)] = $original_func_name($(argname_list...))
+                end
             end
+        )
+        funcrett != nothing && map([original_func, func_main]) do func
+            func.args[1] = :($(func.args[1])::$funcrett)
+        end
+        result = quote
+            $original_func
+            const $cache_struct = Core.Inference.return_type($original_func_name, ($(argtype_list...),))
+            const $func_cachename = $dict_type()
+            $func_main
             if !haskey(LocalMemoize.MemoizedFunctions, typeof($funcname))
                 LocalMemoize.MemoizedFunctions[typeof($funcname)] = Any[]
             end
@@ -144,11 +158,7 @@ macro memoize(expr)
         # For first time run
         func1 = :(function $func1_name($func_cachename::$dict_type, $(argdef_list...)) end)
         # For memoized runs
-        func2 = :(
-            function $func2_name($func_cachename::$dict_type, $(argdef_list...))
-                $cachename = $func_cachename[($(memo_argnames...),)]
-            end
-        )
+        func2 = :(function $func2_name($cachename::$cache_struct, $(argdef_list...)) end)
         gettype_func_body = gettype_func.args[end].args
         func1_body = func1.args[end].args
         func2_body = func2.args[end].args
@@ -179,11 +189,21 @@ macro memoize(expr)
                 push!(func2_body, expression)
             end
         end
-
+        func_main = :(function $funcname($(argdef_list...))
+            $index_name = Base.ht_keyindex($func_cachename, ($(memo_argnames...),))
+            if $index_name >= 0
+                @inbounds $cachename = $func_cachename.vals[$index_name]
+                $func2_name($cachename, $(argname_list...))
+            else
+                $func1_name($func_cachename, $(argname_list...))
+            end
+        end)
+        funcrett != nothing && map([func1, func2, func_main]) do func
+            func.args[1] = :($(func.args[1])::$funcrett)
+        end
         result = quote
             let gettype_func = $gettype_func
-                code_info = code_typed(gettype_func, ($(argtype_list...),))
-                types = code_info[1].second
+                types = Core.Inference.return_type(gettype_func, ($(argtype_list...),))
                 cache_struct = $(QuoteNode(cache_struct))
                 struct_code = :(struct $cache_struct end)
                 argnames = $memolist
@@ -192,14 +212,10 @@ macro memoize(expr)
                 end
                 eval(struct_code)
             end
-            $func_cachename = $dict_type()
+            const $func_cachename = $dict_type()
             $func1
             $func2
-            function $funcname($(argdef_list...))
-                haskey($func_cachename, ($(memo_argnames...),)) ?
-                    $func2_name($func_cachename, $(argname_list...)) :
-                    $func1_name($func_cachename, $(argname_list...))
-            end
+            $func_main
             if !haskey(LocalMemoize.MemoizedFunctions, typeof($funcname))
                 LocalMemoize.MemoizedFunctions[typeof($funcname)] = Any[]
             end
