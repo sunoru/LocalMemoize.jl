@@ -53,8 +53,9 @@ macro memoize(expr)
         arg.args[1] == Symbol("@memo") && length(arg.args) > 1
     for arg in funcargs
         if check_memocall(arg)
-            length(arg.args) != 2 && error("@memo in argument list only must have one and only one argument.")
-            argdef = arg.args[2]
+            tmp = filter(x -> !(x isa LineNumberNode), arg.args)
+            length(tmp) != 2 && error("@memo in argument list only must have one and only one argument.")
+            argdef = tmp[2]
         else
             argdef = arg
         end
@@ -93,10 +94,11 @@ macro memoize(expr)
     memolist = Symbol[]
     for (i, expression) in enumerate(funcbody.args)
         if check_memocall(expression)
-            if check_memolist(expression.args[2:end])
-                append!(memolist, expression.args[2:end])
-            elseif check_assignment(expression.args[2])
-                push!(memolist, expression.args[2].args[1])
+            tmp = filter(x -> !(x isa LineNumberNode), expression.args)
+            if check_memolist(tmp[2:end])
+                append!(memolist, tmp[2:end])
+            elseif check_assignment(tmp[2])
+                push!(memolist, tmp[2].args[1])
             else
                 error("@memo in body must be used on an assignment or a list of variables to be memoized.")
             end
@@ -165,9 +167,10 @@ macro memoize(expr)
 
         for (i, expression) in enumerate(funcbody.args)
             if check_memocall(expression)
-                if !check_memolist(expression.args[2:end])
-                    push!(gettype_func_body, expression.args[2])
-                    push!(func1_body, expression.args[2])
+                tmp = filter(x -> !(x isa LineNumberNode), expression.args)
+                if !check_memolist(tmp[2:end])
+                    push!(gettype_func_body, tmp[2])
+                    push!(func1_body, tmp[2])
                 end
             else
                 push!(gettype_func_body, expression)
@@ -204,8 +207,8 @@ macro memoize(expr)
         result = quote
             let gettype_func = $gettype_func
                 types = Core.Inference.return_type(gettype_func, ($(argtype_list...),))
-                cache_struct = $(QuoteNode(cache_struct))
-                struct_code = :(struct $cache_struct end)
+                cache_struct_name = $(QuoteNode(cache_struct))
+                struct_code = :(struct $cache_struct_name end)
                 argnames = $memolist
                 for (argname, typ) in zip(argnames, types.types)
                     push!(struct_code.args[end].args, :($argname::$typ))
