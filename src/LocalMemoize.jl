@@ -150,7 +150,7 @@ macro memoize(expr)
             push!(LocalMemoize.MemoizedFunctions[typeof($funcname)], $func_cachename)
             $funcname
         end
-     else
+    else
         gettype_func_name = getsymbol("gettype")
         func1_name = getsymbol("1")
         func2_name = getsymbol("2")
